@@ -4,10 +4,10 @@ import numpy as np
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-client = OpenAI(api_key=OPENAI_KEY)
+
+user_sessions = {}
 
 with open("knowledge.txt", "r", encoding="utf-8") as f:
     text = f.read()
@@ -17,7 +17,7 @@ valid_chunks = [chunk for chunk in chunks if chunk.strip()]
 
 def get_embedding(text):
     response = client.embeddings.create(
-        model="text-embedding-3-small",
+        model = "text-embedding-3-small",
         input=text
     )
     return response.data[0].embedding
@@ -33,7 +33,7 @@ chunk_embeddings = [
 def cosine_similarity(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-def find_relevant_chunks(query, top_k=5):
+def find_relevant_chunks(query, top_k = 3):
     query_embedding = get_embedding(preprocess(query))
     
     scores = []
@@ -42,82 +42,88 @@ def find_relevant_chunks(query, top_k=5):
         scores.append((score, valid_chunks[i]))
         
     scores.sort(reverse=True)
-    return [chunk for _, chunk in scores[:top_k]]\
+    return [chunk for _, chunk in scores[:top_k]]
 
-def classify_query(query):
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": """
-You are a strict classifier.
-
-If the question is about:
-- services
-- prices
-- repair
-- company
-- cars
-
-Return ONLY: RAG
-
-If it's casual conversation (hello, how are you, jokes):
-Return ONLY: GENERAL
+rag_intent = """
+oil change price
+service cost
+car repair price
+bmw repair
+toyota service
+diagnostics cost
+location almaty working hours
 """
-            },
-            {
-                "role":"user",
-                "content": query
-            }
+
+rag_intent_embedding = get_embedding(preprocess(rag_intent))
+
+def get_user_messages(user_id):
+    if user_id not in user_sessions:
+        user_sessions[user_id] = [
+            {"role": "system", "content": "You are a helpful AI assistant."}
         ]
-    )
-    return response.choices[0].message.content.strip()
+    return user_sessions[user_id]
 
-messages = [
-    {
-        "role":"system", "content": "You are a helpful assistant."
-    }
-]
+def is_raq_query(query, threshold=0.4):
+    query_embedding = get_embedding(preprocess(query))
+    
+    score = cosine_similarity(query_embedding, rag_intent_embedding)
+    
+    print("DEBUG SCORE:", score)
+    
+    return score > threshold
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context:ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     user_input = update.message.text
     
-    query_type = classify_query(user_input)
+    messages = get_user_messages(user_id)
     
-    if query_type == "RAG":
+    use_rag = is_raq_query(user_input)
+    
+    if use_rag:
         relevant_chunks = find_relevant_chunks(user_input)
         context_text = "\n".join(relevant_chunks)
         
         prompt = f"""
-Use this context:
-    
+You MUST answer using ONLY the context below.
+
+Context:
 {context_text}
 
 Question:
 {user_input}
 
-If answer not found, say you don't know.
+i answer is not in context, say "I don't know."
 """
     else:
         prompt = user_input
         
-    messages.append({"role": "user", "content": prompt})
+    messages.append({
+        "role":"user",
+        "content": prompt
+    })
     
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model = "gpt-4o-mini",
         messages=messages
     )
     
     answer = response.choices[0].message.content
     
-    messages.append({"role": "assistant", "content": answer})
+    messages.append({
+        "role":"assistant",
+        "content": answer
+    })
     
+    if len(messages) > 12:
+        messages[:] =[messages[0]]+ messages[-10:]
+        
     await update.message.reply_text(answer)
-
+    
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
 print("Bot is running...")
 app.run_polling()
-
+    
